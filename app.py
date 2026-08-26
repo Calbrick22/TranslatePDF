@@ -53,6 +53,12 @@ from typing import List, Optional, Tuple
 
 import fitz  # PyMuPDF
 import requests
+
+from rowfilter import (
+    TableRow, scan_document, summarise_countries, build_rows,
+    assign_countries, UNKNOWN_LABEL,
+)
+from rowbuild import assign_blocks_to_rows, build_filtered_document
 import streamlit as st
 from PIL import Image
 
@@ -162,6 +168,193 @@ class TextBlock:
 # ---------------------------------------------------------------------------
 # Core processing functions
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Country-of-origin row filtering
+# ---------------------------------------------------------------------------
+# Lets the user keep only table rows whose country-of-origin matches their
+# selection. Removal is structural: the whole row band (text AND images) is
+# excluded from the rebuilt document, not merely blanked.
+#
+# Detection strategy: this document has no vector gridlines (borders are part
+# of a raster image), so rows are located from the country column instead.
+# Each row is anchored by the item-name cell sitting immediately above its
+# country cell in the same narrow left-hand column.
+# ---------------------------------------------------------------------------
+
+COUNTRY_VOCAB = {
+    "Russia / CIS": ["CEI", "URSS", "USSR", "RUSSIE", "RUSSIA"],
+    "Czech Republic": ["TCHEQUE", "CZECH", "TCHECOSLOVAQUIE"],
+    "United Kingdom": ["GB", "GRANDE BRETAGNE", "UNITED KINGDOM", "ROYAUME UNI", "BRITAIN"],
+    "China": ["CHINE", "CHINA"],
+    "Italy": ["ITALIE", "ITALY"],
+    "Yugoslavia": ["YOUGOSLAVIE", "YUGOSLAVIA"],
+    "Germany": ["ALLEMAGNE", "GERMANY", "RDA", "RFA"],
+    "USA": ["USA", "ETATS UNIS", "UNITED STATES"],
+    "Pakistan": ["PAKISTAN"],
+    "Spain": ["ESPAGNE", "SPAIN"],
+    "Belgium": ["BELGIQUE", "BELGIUM"],
+    "Romania": ["ROUMANIE", "ROMANIA"],
+    "South Africa": ["AFRIQUE DU SUD", "SOUTH AFRICA", "AFRIQUE", "AFRICA"],
+    "Albania": ["ALBANIE", "ALBANIA"],
+    "France": ["FRANCE"],
+    "Egypt": ["EGYPTE", "EGYPT"],
+    "Israel": ["ISRAEL"],
+    "Sweden": ["SUEDE", "SWEDEN"],
+    "Portugal": ["PORTUGAL"],
+    "Hungary": ["HONGRIE", "HUNGARY"],
+    "Bulgaria": ["BULGARIE", "BULGARIA"],
+    "Poland": ["POLOGNE", "POLAND"],
+    "Austria": ["AUTRICHE", "AUSTRIA"],
+    "Switzerland": ["SUISSE", "SWITZERLAND"],
+    "Vietnam": ["VIETNAM"],
+    "India": ["INDE", "INDIA"],
+    "Iran": ["IRAN"],
+    "Iraq": ["IRAK", "IRAQ"],
+    "Turkey": ["TURQUIE", "TURKEY"],
+    "Greece": ["GRECE", "GREECE"],
+}
+
+# Fraction of page width searched for the country column, and max cell width.
+COUNTRY_COL_MAX_X_FRAC = 0.35
+COUNTRY_CELL_MAX_WIDTH = 140
+ROW_TOP_PADDING = 6.0
+
+
+@dataclass
+class TableRow:
+    """One logical table row on a page."""
+    page_index: int
+    top: float
+    bottom: float
+    country: str
+    raw_text: str
+
+    @property
+    def height(self) -> float:
+        return max(self.bottom - self.top, 0.0)
+
+
+def _normalise_for_country(s: str) -> str:
+    s = s.upper()
+    for a, b in (("È", "E"), ("É", "E"), ("Ê", "E"), ("Ë", "E"),
+                 ("Ç", "C"), ("Ô", "O"), ("Î", "I"), ("À", "A")):
+        s = s.replace(a, b)
+    return re.sub(r"[^A-Z ]+", " ", s)
+
+
+def match_country(text: str) -> Optional[str]:
+    """Return the canonical country name found in `text`, or None."""
+    n = _normalise_for_country(text)
+    best, best_len = None, 0
+    for canon, aliases in COUNTRY_VOCAB.items():
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", n) and len(alias) > best_len:
+                best, best_len = canon, len(alias)
+    return best
+
+
+def _plain_blocks(page: fitz.Page):
+    out = []
+    for b in page.get_text("dict").get("blocks", []):
+        if b.get("type") != 0:
+            continue
+        t = " ".join(
+            "".join(s["text"] for s in l.get("spans", []))
+            for l in b.get("lines", [])
+        ).strip()
+        if t:
+            out.append((fitz.Rect(b["bbox"]), t))
+    return out
+
+
+def detect_table_rows(page: fitz.Page, page_index: int) -> List[TableRow]:
+    """
+    Locate table rows on a page via the country column.
+
+    Returns rows in reading order. `top`/`bottom` describe the full-width
+    band belonging to that row, so callers can slice it out wholesale
+    (including any images inside it).
+    """
+    blocks = _plain_blocks(page)
+    max_x = page.rect.width * COUNTRY_COL_MAX_X_FRAC
+
+    hits = []
+    for r, t in blocks:
+        if r.x0 < max_x and r.width < COUNTRY_CELL_MAX_WIDTH:
+            c = match_country(t)
+            if c:
+                hits.append([r, t, c])
+    hits.sort(key=lambda h: h[0].y0)
+
+    # Merge a country cell split across consecutive lines
+    merged = []
+    for h in hits:
+        if merged and h[0].y0 - merged[-1][0].y1 < 14 and merged[-1][2] == h[2]:
+            merged[-1][0] = merged[-1][0] | h[0]
+            merged[-1][1] = merged[-1][1] + " " + h[1]
+        else:
+            merged.append(list(h))
+
+    anchors = []
+    for r, t, c in merged:
+        # The item-name cell is the block IMMEDIATELY above the country cell.
+        # Take the nearest (largest y1), not the topmost - otherwise we skip
+        # past it onto the previous row or the page header.
+        above = [
+            rr for rr, _ in blocks
+            if rr.y1 <= r.y0 + 2 and rr.y0 > r.y0 - 70
+            and rr.x0 < max_x and rr.width < COUNTRY_CELL_MAX_WIDTH
+        ]
+        top = max(above, key=lambda rr: rr.y1).y0 if above else r.y0
+        anchors.append((min(top, r.y0), c, t))
+
+    anchors.sort(key=lambda a: a[0])
+
+    rows: List[TableRow] = []
+    for i, (top, country, raw) in enumerate(anchors):
+        band_top = max(top - ROW_TOP_PADDING, 0.0)
+        if i + 1 < len(anchors):
+            band_bottom = max(anchors[i + 1][0] - ROW_TOP_PADDING, band_top)
+        else:
+            band_bottom = page.rect.height
+        rows.append(TableRow(page_index, band_top, band_bottom, country, raw))
+    return rows
+
+
+def scan_document_countries(file_bytes: bytes) -> Tuple[dict, List[TableRow]]:
+    """
+    Scan the PDF and report which countries of origin appear, with row counts.
+
+    Returns (counts_by_country, all_rows).
+    """
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    all_rows: List[TableRow] = []
+    try:
+        for pno in range(doc.page_count):
+            all_rows.extend(detect_table_rows(doc[pno], pno))
+    finally:
+        doc.close()
+
+    counts: dict = {}
+    for r in all_rows:
+        counts[r.country] = counts.get(r.country, 0) + 1
+    return counts, all_rows
+
+
+def header_band_for_page(page: fitz.Page, rows: List[TableRow]) -> Optional[fitz.Rect]:
+    """
+    The strip above the first row - i.e. the column header - so filtered
+    output keeps its headings instead of showing bare rows.
+    """
+    page_rows = [r for r in rows if r.page_index == page.number]
+    if not page_rows:
+        return None
+    first_top = min(r.top for r in page_rows)
+    if first_top <= 2:
+        return None
+    return fitz.Rect(0, 0, page.rect.width, first_top)
 
 def extract_text_blocks(page: fitz.Page) -> List[TextBlock]:
     """
@@ -933,6 +1126,164 @@ def fit_text_in_box(
     )
 
 
+def scan_pdf_countries(file_bytes: bytes, zoom: float = 2.0):
+    """
+    Pass 1 for the filtering workflow: detect table rows and their
+    countries of origin, without translating anything.
+
+    Returns (rows, summary) where summary is [(country, row_count), ...].
+    """
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        rows = scan_document(doc, zoom=zoom)
+        summary = summarise_countries(rows)
+    finally:
+        doc.close()
+    return rows, summary
+
+
+def process_pdf_filtered(
+    file_bytes: bytes,
+    selected_countries: List[str],
+    provider,
+    status_cb=None,
+    progress_cb=None,
+    use_ocr: bool = False,
+    render_zoom: float = RENDER_ZOOM,
+) -> Tuple[bytes, dict]:
+    """
+    Translate and rebuild the PDF keeping ONLY rows whose country of origin
+    is in `selected_countries`.
+
+    Dropped rows are removed whole - their images and diagrams go with
+    them, because each row travels as a rendered pixel strip. Kept rows are
+    stacked under a repeated header so the output closes up rather than
+    leaving gaps.
+
+    Only text from kept rows is sent for translation, so filtering also
+    reduces API usage.
+    """
+    src = fitz.open(stream=file_bytes, filetype="pdf")
+    total_pages = src.page_count
+    if total_pages == 0:
+        raise ValueError("This PDF appears to have no pages.")
+
+    wanted = set(selected_countries)
+
+    all_rows: List[TableRow] = []
+    row_blocks: dict = {}
+    page_backgrounds: List[Image.Image] = []
+    page_rects: List[fitz.Rect] = []
+    keep_keys: List[Tuple[int, int]] = []
+    country_col = None
+
+    # --- Pass 1: per page, detect rows, keep/drop, build clean background --
+    for pno in range(total_pages):
+        if status_cb:
+            status_cb(f"Analysing table rows... (page {pno + 1}/{total_pages})")
+
+        page = src[pno]
+
+        rows, v_lines = build_rows(page, pno, zoom=2.0)
+        country_col = assign_countries(page, rows, v_lines, country_col) or country_col
+
+        blocks = extract_text_blocks(page)
+        if use_ocr and OCR_AVAILABLE:
+            blocks.extend(ocr_extract_blocks(page, blocks))
+        blocks = merge_blocks_into_paragraphs(blocks)
+
+        mapping = assign_blocks_to_rows(blocks, rows)
+        for ridx, blist in mapping.items():
+            row_blocks[(pno, ridx)] = blist
+
+        for ridx, r in enumerate(rows):
+            if not r.is_header and r.country in wanted:
+                keep_keys.append((pno, ridx))
+
+        # Erase original text, then render the page as a clean background.
+        redact_blocks(page, blocks, redact_image_pixels=False)
+        pix = page.get_pixmap(matrix=fitz.Matrix(render_zoom, render_zoom), alpha=False)
+        page_backgrounds.append(Image.open(io.BytesIO(pix.tobytes("png"))))
+        page_rects.append(fitz.Rect(page.rect))
+
+        all_rows.extend(rows)
+        if progress_cb:
+            progress_cb((pno + 1) / total_pages * 0.35)
+
+    src.close()
+
+    if not keep_keys:
+        raise ValueError(
+            "None of the selected countries matched any rows in this document."
+        )
+
+    # --- Pass 2: translate ONLY the blocks in kept rows --------------------
+    # Headers are kept too so the rebuilt table stays readable.
+    header_keys = [
+        (r.page_no, _row_index_on_page(r, all_rows))
+        for r in all_rows if r.is_header
+    ]
+    translate_keys = set(keep_keys) | set(header_keys)
+
+    flat_blocks = []
+    for key in translate_keys:
+        flat_blocks.extend(row_blocks.get(key, []))
+
+    if status_cb:
+        status_cb(f"Translating {len(flat_blocks)} text blocks from kept rows...")
+
+    def _tp(done, total):
+        if progress_cb:
+            progress_cb(0.35 + (done / max(total, 1)) * 0.45)
+
+    tstats = translate_blocks(flat_blocks, provider, progress_cb=_tp)
+
+    # --- Pass 3: rebuild, compacting kept rows -----------------------------
+    if status_cb:
+        status_cb("Rebuilding filtered PDF...")
+
+    def draw_text(new_page, block, dy):
+        shifted = fitz.Rect(
+            block.bbox.x0, block.bbox.y0 + dy,
+            block.bbox.x1, block.bbox.y1 + dy,
+        )
+        fit_text_in_box(
+            new_page, shifted,
+            block.translated_text or block.text,
+            block.font_size, block.color,
+        )
+
+    out_doc = build_filtered_document(
+        page_backgrounds=page_backgrounds,
+        page_rects=page_rects,
+        rows=all_rows,
+        row_blocks=row_blocks,
+        keep_row_keys=keep_keys,
+        zoom=render_zoom,
+        draw_text=draw_text,
+    )
+
+    if progress_cb:
+        progress_cb(1.0)
+
+    out_bytes = out_doc.tobytes(garbage=4, deflate=True)
+    out_doc.close()
+
+    tstats["rows_kept"] = len(keep_keys)
+    tstats["rows_total"] = len([r for r in all_rows if not r.is_header])
+    return out_bytes, tstats
+
+
+def _row_index_on_page(row: TableRow, rows: List[TableRow]) -> int:
+    i = 0
+    for r in rows:
+        if r.page_no == row.page_no:
+            if r is row:
+                return i
+            i += 1
+    return 0
+
+
 def process_pdf(
     file_bytes: bytes,
     status_cb=None,
@@ -940,6 +1291,7 @@ def process_pdf(
     use_ocr: bool = True,
     render_zoom: float = RENDER_ZOOM,
     provider=None,
+    keep_countries: Optional[set] = None,
 ) -> Tuple[bytes, dict]:
     """
     Full pipeline: open -> extract (native + OCR) -> merge into paragraphs
@@ -957,6 +1309,7 @@ def process_pdf(
     all_page_blocks: List[List[TextBlock]] = []
     page_images: List[bytes] = []
     page_sizes: List[fitz.Rect] = []
+    page_kept_bands: List[Optional[List[fitz.Rect]]] = []
     any_ocr_blocks_found = False  # track if we found any OCR text across all pages
 
     # --- Pass 1: extract text (native + OCR) + build clean background ---
@@ -964,6 +1317,22 @@ def process_pdf(
         if status_cb:
             status_cb(f"Extracting layout... (page {pno + 1}/{total_pages})")
         page = src_doc[pno]
+
+        # Country filtering: work out which row bands to keep on this page.
+        # Detection must happen BEFORE redaction, while text is intact.
+        if keep_countries is not None:
+            rows_here = detect_table_rows(page, pno)
+            kept_bands = [
+                fitz.Rect(0, r.top, page.rect.width, r.bottom)
+                for r in rows_here if r.country in keep_countries
+            ]
+            hdr = header_band_for_page(page, rows_here)
+            if hdr is not None and kept_bands:
+                kept_bands.insert(0, hdr)
+            page_kept_bands.append(kept_bands)
+        else:
+            page_kept_bands.append(None)
+
         blocks = extract_text_blocks(page)
         ocr_blocks: List[TextBlock] = []
 
@@ -982,6 +1351,15 @@ def process_pdf(
         # translation quality AND cuts the number of network requests,
         # which is the main cause of text being left untranslated.
         blocks = merge_blocks_into_paragraphs(blocks)
+
+        # Discard text belonging to excluded rows: it must not be translated
+        # (wasted quota) and must not appear in the output.
+        bands = page_kept_bands[pno]
+        if bands is not None:
+            blocks = [
+                b for b in blocks
+                if any(_rect_mostly_inside(b.bbox, band) for band in bands)
+            ]
 
         # Only use pixel redaction if we actually found OCR blocks AND OCR is enabled.
         # For clean native-text PDFs, use non-pixel redaction to preserve diagram quality.
@@ -1153,11 +1531,84 @@ def main():
     if "translated_pdf_bytes" not in st.session_state:
         st.session_state.translated_pdf_bytes = None
         st.session_state.translated_filename = None
+    if "country_summary" not in st.session_state:
+        st.session_state.country_summary = None
+        st.session_state.scanned_filename = None
 
     if uploaded_file is not None:
         st.success(f"Loaded: **{uploaded_file.name}** ({uploaded_file.size / 1024:.0f} KB)")
 
-        translate_clicked = st.button("🔁 Translate PDF", type="primary", use_container_width=True)
+        # ---------------------------------------------------------------
+        # Optional filtering by country of origin
+        # ---------------------------------------------------------------
+        filter_mode = st.checkbox(
+            "🌍 Only include certain countries of origin",
+            value=False,
+            help=(
+                "Scans the document's table for a country column, then lets you "
+                "keep only the rows you want. Dropped rows are removed entirely, "
+                "including their photos and diagrams."
+            ),
+        )
+
+        selected_countries: List[str] = []
+
+        if filter_mode:
+            # Re-scan if a different file was uploaded
+            if st.session_state.scanned_filename != uploaded_file.name:
+                st.session_state.country_summary = None
+
+            if st.session_state.country_summary is None:
+                if st.button("🔎 Scan for countries", use_container_width=True):
+                    with st.spinner("Scanning table rows..."):
+                        try:
+                            _, summary = scan_pdf_countries(uploaded_file.getvalue())
+                            st.session_state.country_summary = summary
+                            st.session_state.scanned_filename = uploaded_file.name
+                        except Exception as e:
+                            st.error(f"Could not analyse the table: {e}")
+
+            summary = st.session_state.country_summary
+            if summary:
+                found = [c for c, _ in summary if c != UNKNOWN_LABEL]
+                unknown_n = dict(summary).get(UNKNOWN_LABEL, 0)
+
+                if not found:
+                    st.warning(
+                        "No countries were recognised in this document. It may not "
+                        "have a country column, or the wording may be unfamiliar. "
+                        "Uncheck the filter to translate the whole file."
+                    )
+                else:
+                    st.caption(
+                        f"Found {len(found)} countries across "
+                        f"{sum(n for c, n in summary if c != UNKNOWN_LABEL)} rows."
+                    )
+                    selected_countries = st.multiselect(
+                        "Countries to include",
+                        options=[c for c, _ in summary if c != UNKNOWN_LABEL],
+                        default=[],
+                        format_func=lambda c: f"{c}  ({dict(summary)[c]} rows)",
+                    )
+                    if unknown_n:
+                        if st.checkbox(
+                            f"Also include {unknown_n} rows with no identified country"
+                        ):
+                            selected_countries = selected_countries + [UNKNOWN_LABEL]
+
+                    if selected_countries:
+                        kept = sum(dict(summary).get(c, 0) for c in selected_countries)
+                        st.info(f"**{kept} rows** will be kept; the rest will be removed.")
+                    else:
+                        st.warning("Select at least one country to continue.")
+
+        button_label = (
+            "🔁 Translate selected rows" if filter_mode else "🔁 Translate PDF"
+        )
+        translate_clicked = st.button(
+            button_label, type="primary", use_container_width=True,
+            disabled=(filter_mode and not selected_countries),
+        )
 
         if translate_clicked:
             file_bytes = uploaded_file.read()
@@ -1183,13 +1634,25 @@ def main():
                 else:
                     provider = GoogleProvider()
 
-                result_bytes, tstats = process_pdf(
-                    file_bytes,
-                    status_cb=status_cb,
-                    progress_cb=progress_cb,
-                    use_ocr=use_ocr,
-                    render_zoom=render_zoom,
-                    provider=provider,
+                result_bytes, tstats = (
+                    process_pdf_filtered(
+                        file_bytes,
+                        selected_countries=selected_countries,
+                        provider=provider,
+                        status_cb=status_cb,
+                        progress_cb=progress_cb,
+                        use_ocr=use_ocr,
+                        render_zoom=render_zoom,
+                    )
+                    if (filter_mode and selected_countries)
+                    else process_pdf(
+                        file_bytes,
+                        status_cb=status_cb,
+                        progress_cb=progress_cb,
+                        use_ocr=use_ocr,
+                        render_zoom=render_zoom,
+                        provider=provider,
+                    )
                 )
                 elapsed = time.time() - start
 
@@ -1209,8 +1672,15 @@ def main():
                         "wait a few minutes and try again."
                     )
                 elif failed == 0:
+                    rows_note = ""
+                    if "rows_kept" in tstats:
+                        rows_note = (
+                            f" Kept {tstats['rows_kept']} of "
+                            f"{tstats['rows_total']} rows."
+                        )
                     status_placeholder.success(
-                        f"Done in {elapsed:.0f} seconds — all {ok} text blocks translated."
+                        f"Done in {elapsed:.0f} seconds — all {ok} text blocks "
+                        f"translated.{rows_note}"
                     )
                 else:
                     status_placeholder.warning(
