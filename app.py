@@ -573,17 +573,21 @@ DEEPL_MAX_TEXTS_PER_REQUEST = 50
 
 class DeepLProvider:
     """
-    Direct DeepL API client.
+    Direct DeepL API client (current v2 spec).
 
-    Uses DeepL's native multi-text batching: we send up to 50 strings in one
-    request and get back a list in the same order. Because the API preserves
-    ordering and count, there is no delimiter to be mangled and no risk of a
-    translation landing in the wrong box.
+    Authentication uses the `Authorization: DeepL-Auth-Key <key>` header.
+    DeepL removed the older `auth_key` body/query parameter in November 2025;
+    requests using it now fail with 403 regardless of how valid the key is.
+
+    Uses DeepL's native multi-text batching: up to 50 strings per request,
+    returned as an ordered list. Because the API preserves order and count,
+    there is no delimiter to be mangled and no risk of a translation landing
+    in the wrong box.
     """
 
     name = "DeepL"
     max_batch_items = DEEPL_MAX_TEXTS_PER_REQUEST
-    max_batch_chars = 100_000  # DeepL handles large payloads comfortably
+    max_batch_chars = 100_000  # DeepL caps the request body at 128 KiB
 
     def __init__(self, api_key: str, source: str = "FR", target: str = "EN-GB"):
         self.api_key = api_key.strip()
@@ -592,33 +596,91 @@ class DeepLProvider:
         # DeepL free keys conventionally end in ":fx"
         self.url = DEEPL_FREE_URL if self.api_key.endswith(":fx") else DEEPL_PRO_URL
 
-    def translate_many(self, texts: List[str]) -> List[Optional[str]]:
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"DeepL-Auth-Key {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    @staticmethod
+    def _extract_api_message(resp) -> str:
+        """Pull DeepL's own error text out of the response, if present."""
+        try:
+            body = resp.json()
+            msg = body.get("message") or body.get("detail")
+            return f" DeepL said: {msg}" if msg else ""
+        except Exception:
+            return ""
+
+    def _raise_for_status(self, resp) -> None:
+        detail = self._extract_api_message(resp)
+
+        if resp.status_code in (401, 403):
+            hint = ""
+            if not self.api_key.endswith(":fx") and "free" in self.url:
+                hint = ""
+            raise RuntimeError(
+                "DeepL rejected the API key (HTTP "
+                f"{resp.status_code}).{detail}\n\n"
+                "Things to check:\n"
+                "• The key is copied in full, with no missing characters or "
+                "trailing spaces.\n"
+                "• Free keys end in ':fx' and use the free endpoint; keys "
+                "without that suffix are treated as Pro.\n"
+                "• The DeepL account is activated — new accounts sometimes "
+                "need email/identity verification before the API works."
+                + hint
+            )
+        if resp.status_code == 456:
+            raise RuntimeError(
+                "This DeepL key has used up its monthly character quota."
+                f"{detail} The free tier allows 500,000 characters per month."
+            )
+        if resp.status_code == 400:
+            raise RuntimeError(
+                f"DeepL rejected the request (HTTP 400).{detail}"
+            )
+
+    def check_key(self) -> str:
+        """
+        Verify the key with one tiny translation. Raises RuntimeError with a
+        readable explanation if the key is bad, otherwise returns a sample.
+        """
+        out = self.translate_many(["Bonjour"], _raise_on_http_error=True)
+        if not out or not out[0]:
+            raise RuntimeError(
+                "DeepL accepted the key but returned no translation. "
+                "Please try again in a moment."
+            )
+        return out[0]
+
+    def translate_many(
+        self, texts: List[str], _raise_on_http_error: bool = True
+    ) -> List[Optional[str]]:
         if not texts:
             return []
+
+        payload = {
+            "text": texts,
+            "source_lang": self.source,
+            "target_lang": self.target,
+        }
 
         try:
             resp = requests.post(
                 self.url,
-                data=[
-                    ("auth_key", self.api_key),
-                    ("source_lang", self.source),
-                    ("target_lang", self.target),
-                ] + [("text", t) for t in texts],
+                headers=self._headers(),
+                json=payload,
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
         except Exception:
             return [None] * len(texts)
 
-        if resp.status_code == 403:
-            raise RuntimeError(
-                "DeepL rejected the API key (403). Please double-check you "
-                "pasted the whole key, including the ':fx' suffix on free keys."
-            )
-        if resp.status_code == 456:
-            raise RuntimeError(
-                "This DeepL key has used up its monthly character quota. "
-                "The free tier allows 500,000 characters per month."
-            )
+        # Auth/quota problems must reach the user rather than silently
+        # producing an all-French document.
+        if _raise_on_http_error:
+            self._raise_for_status(resp)
+
         if resp.status_code != 200:
             return [None] * len(texts)
 
@@ -1033,6 +1095,16 @@ def main():
             placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx",
             help="Your key is used only for this translation and is never stored.",
         )
+        if deepl_key:
+            if st.button("🔑 Test this key", use_container_width=True):
+                try:
+                    sample = DeepLProvider(deepl_key).check_key()
+                    st.success(f"Key works. \"Bonjour\" → \"{sample}\"")
+                except RuntimeError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"Could not reach DeepL: {e}")
+
         with st.expander("How to get a free DeepL key (2 minutes)"):
             st.markdown(
                 """
