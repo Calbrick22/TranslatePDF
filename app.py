@@ -92,8 +92,8 @@ DEFAULT_FONT = "helv"        # a safe built-in PyMuPDF font (Helvetica)
 MAX_CHARS_PER_TRANSLATE_CALL = 4500  # stay comfortably under API limits
 REDACT_PADDING = 0.6         # small padding so redaction fully covers glyph edges
 OCR_ZOOM = 3.0                # resolution used when rendering the page for OCR
-OCR_MIN_CONFIDENCE = 45       # discard low-confidence OCR guesses (0-100 scale)
-OCR_OVERLAP_THRESHOLD = 0.3   # skip an OCR box if it overlaps a native text box this much (avoids duplicates)
+OCR_MIN_CONFIDENCE = 65       # discard low-confidence OCR guesses (0-100 scale); high threshold to avoid noise
+OCR_OVERLAP_THRESHOLD = 0.25  # skip an OCR box if it overlaps a native text box this much (avoids duplicates)
 
 
 # ---------------------------------------------------------------------------
@@ -175,21 +175,98 @@ def extract_text_blocks(page: fitz.Page) -> List[TextBlock]:
     return blocks
 
 
-def redact_blocks(page: fitz.Page, blocks: List[TextBlock]) -> None:
+def merge_nearby_blocks(
+    blocks: List[TextBlock],
+    y_gap_factor: float = 1.4,
+    min_x_overlap_frac: float = 0.5,
+) -> List[TextBlock]:
+    """
+    Some PDFs (often ones exported from tables/spreadsheets, or with
+    generous line spacing) store every single LINE of a paragraph as its
+    own separate text block, instead of one block per paragraph. If we
+    translated each of those tiny fragments independently, we'd lose all
+    sentence context AND multiply the number of translation API calls
+    (which risks rate-limiting on large documents).
+
+    This groups blocks that are vertically stacked close together and
+    horizontally aligned (i.e. clearly the same paragraph/column) into a
+    single merged block covering their combined area, in reading order.
+    Blocks in different table columns/cells won't merge because their
+    x-ranges won't overlap enough.
+    """
+    if not blocks:
+        return blocks
+
+    remaining = sorted(blocks, key=lambda b: (b.bbox.y0, b.bbox.x0))
+    used = [False] * len(remaining)
+    merged: List[TextBlock] = []
+
+    for i, seed in enumerate(remaining):
+        if used[i]:
+            continue
+        cluster = [seed]
+        used[i] = True
+
+        grew = True
+        while grew:
+            grew = False
+            cx0 = min(c.bbox.x0 for c in cluster)
+            cx1 = max(c.bbox.x1 for c in cluster)
+            cy1 = max(c.bbox.y1 for c in cluster)
+
+            for j, cand in enumerate(remaining):
+                if used[j]:
+                    continue
+                gap = cand.bbox.y0 - cy1
+                if gap < -1:  # already vertically overlapping the cluster
+                    gap = 0
+                if gap > cand.bbox.height * y_gap_factor:
+                    continue  # too far below to be the same paragraph
+
+                ox0 = max(cx0, cand.bbox.x0)
+                ox1 = min(cx1, cand.bbox.x1)
+                overlap = max(0.0, ox1 - ox0)
+                min_width = min(cx1 - cx0, cand.bbox.x1 - cand.bbox.x0)
+                overlap_frac = (overlap / min_width) if min_width > 0 else 0.0
+
+                if overlap_frac >= min_x_overlap_frac:
+                    cluster.append(cand)
+                    used[j] = True
+                    grew = True
+
+        cluster.sort(key=lambda c: (c.bbox.y0, c.bbox.x0))
+        text = " ".join(c.text for c in cluster)
+        x0 = min(c.bbox.x0 for c in cluster)
+        y0 = min(c.bbox.y0 for c in cluster)
+        x1 = max(c.bbox.x1 for c in cluster)
+        y1 = max(c.bbox.y1 for c in cluster)
+        font_size = max(c.font_size for c in cluster)
+        color = cluster[0].color
+
+        merged.append(
+            TextBlock(text=text, bbox=fitz.Rect(x0, y0, x1, y1), font_size=font_size, color=color)
+        )
+
+    return merged
+
+
+def redact_blocks(page: fitz.Page, blocks: List[TextBlock], redact_image_pixels: bool = False) -> None:
     """
     Erase the original French text from the page while leaving every
     other image, drawing, and background element untouched. This is what
     lets us later render a "clean" background image with nothing but the
     text removed.
 
-    Important: we redact using PDF_REDACT_IMAGE_PIXELS rather than
-    PDF_REDACT_IMAGE_NONE. This means that if French text happens to be
-    baked directly into an image's pixels (e.g. a scanned page, or a
-    diagram with embedded labels) at a location we've detected — either
-    via the native text layer or via OCR — those specific pixels get
-    blanked out too, instead of leaving the original French visible
-    underneath the translated overlay. Pixels outside the redaction
-    boxes (the rest of the image/diagram) are left completely untouched.
+    By default (redact_image_pixels=False), we use PDF_REDACT_IMAGE_NONE,
+    which only removes the PDF's text layer, leaving images/diagrams
+    completely intact. This preserves visual quality perfectly for PDFs
+    with clean native text.
+
+    If redact_image_pixels=True (only when OCR is enabled), we use
+    PDF_REDACT_IMAGE_PIXELS instead, which also blanks pixels under each
+    text box. This catches French text baked into image pixels (scanned
+    pages, diagram labels) but at the cost of potentially destroying
+    fine details in diagrams. Only use this if you've explicitly enabled OCR.
     """
     for tb in blocks:
         pad_rect = fitz.Rect(
@@ -200,7 +277,8 @@ def redact_blocks(page: fitz.Page, blocks: List[TextBlock]) -> None:
         )
         page.add_redact_annot(pad_rect, fill=None)
     if blocks:
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
+        image_mode = fitz.PDF_REDACT_IMAGE_PIXELS if redact_image_pixels else fitz.PDF_REDACT_IMAGE_NONE
+        page.apply_redactions(images=image_mode)
 
 
 def _rects_overlap_ratio(a: fitz.Rect, b: fitz.Rect) -> float:
@@ -470,6 +548,7 @@ def process_pdf(
     all_page_blocks: List[List[TextBlock]] = []
     page_images: List[bytes] = []
     page_sizes: List[fitz.Rect] = []
+    any_ocr_blocks_found = False  # track if we found any OCR text across all pages
 
     # --- Pass 1: extract text (native + OCR) + build clean background ---
     for pno in range(total_pages):
@@ -477,6 +556,7 @@ def process_pdf(
             status_cb(f"Extracting layout... (page {pno + 1}/{total_pages})")
         page = src_doc[pno]
         blocks = extract_text_blocks(page)
+        ocr_blocks: List[TextBlock] = []
 
         if use_ocr and OCR_AVAILABLE:
             if status_cb:
@@ -485,9 +565,13 @@ def process_pdf(
                     f"(page {pno + 1}/{total_pages})"
                 )
             ocr_blocks = ocr_extract_blocks(page, blocks)
+            if ocr_blocks:
+                any_ocr_blocks_found = True
             blocks.extend(ocr_blocks)
 
-        redact_blocks(page, blocks)
+        # Only use pixel redaction if we actually found OCR blocks AND OCR is enabled.
+        # For clean native-text PDFs, use non-pixel redaction to preserve diagram quality.
+        redact_blocks(page, blocks, redact_image_pixels=(any_ocr_blocks_found and use_ocr))
         bg_png = render_background(page)
 
         all_page_blocks.append(blocks)
@@ -566,21 +650,20 @@ def main():
         st.stop()
 
     use_ocr = st.checkbox(
-        "🔍 Also detect text baked into images/scans (OCR)",
-        value=OCR_AVAILABLE,
+        "🔍 Also detect text in images/scans (OCR) — only enable if needed",
+        value=False,
         disabled=not OCR_AVAILABLE,
         help=(
-            "Catches French text that has no selectable text layer — e.g. "
-            "scanned pages, photos, or labels drawn inside diagrams/charts. "
-            "Slightly slower, but recommended for the most complete translation."
+            "Enable only for PDFs with scanned pages or text baked into diagrams. "
+            "OCR can introduce artifacts and is slower. For normal PDFs with "
+            "clean selectable text, leave this OFF for best quality."
         ),
     )
     if not OCR_AVAILABLE:
-        st.warning(
-            "OCR is unavailable because the Tesseract engine isn't installed "
-            "on this machine, so text embedded inside images/scans will be "
-            "left untranslated. See the README for a one-time install step "
-            "to enable this."
+        st.info(
+            "ℹ️ OCR is unavailable — the Tesseract engine isn't installed. "
+            "The app will still work perfectly for PDFs with native text layers. "
+            "See the README to install Tesseract if you need OCR for scanned documents."
         )
 
     uploaded_file = st.file_uploader(
@@ -663,20 +746,29 @@ def main():
             except Exception:
                 st.warning("Could not generate a preview image, but the download above will work.")
 
-    with st.expander("ℹ️ How this works / limitations"):
+    with st.expander("ℹ️ How this works / when to use OCR"):
         st.markdown(
             """
-- Each page is rendered as a background image so **images, charts, and
-  layout stay pixel-identical** to the original.
-- French text is detected, erased, translated to English, and placed
-  back in the exact same spot.
-- If the translated text is longer than the original French, the font
-  size is automatically shrunk to fit inside the original text box.
-- With OCR enabled, text baked into scanned pages, photos, or diagrams
-  (with no selectable text layer) is also detected and translated — not
-  just the PDF's normal text layer.
-- Very complex layouts (tables, rotated text, multi-column magazines)
-  may not be perfectly line-wrapped, but will never overflow their box.
+**Standard mode (OCR OFF — recommended for most PDFs):**
+- Extracts text from the PDF's native text layer (fast, high quality).
+- Renders each page as a background image so images, charts, and layout
+  stay perfectly intact.
+- French text is translated and placed back in the exact same spot.
+- Automatically shrinks font size if English is longer than French.
+
+**OCR mode (for scanned documents):**
+- Enables Tesseract to also scan rendered page images for text with no
+  text layer (scanned pages, handwritten annotations, diagram labels).
+- Slower and OCR can introduce errors, especially on complex layouts.
+- Only enable if your PDF has significant scanned content or embedded
+  image text. For normal digital PDFs, OCR will only add noise.
+
+**Tradeoffs:**
+- Complex layouts (tables, multi-column text, rotated elements) may not
+  wrap perfectly, but will never overflow their box.
+- Text smaller than ~8pt may be difficult for OCR to read accurately.
+- If OCR finds false positives (noise artifacts), they will be translated
+  and may appear in the output.
             """
         )
 
