@@ -90,6 +90,7 @@ MIN_FONT_SIZE = 4.0          # never shrink translated text smaller than this
 FONT_SIZE_STEP = 0.5         # decrement used while auto-fitting text
 DEFAULT_FONT = "helv"        # a safe built-in PyMuPDF font (Helvetica)
 MAX_CHARS_PER_TRANSLATE_CALL = 4500  # stay comfortably under API limits
+TRANSLATE_THROTTLE_SECONDS = 0.35    # pause between new translation requests to avoid rate limiting
 REDACT_PADDING = 0.6         # small padding so redaction fully covers glyph edges
 OCR_ZOOM = 3.0                # resolution used when rendering the page for OCR
 OCR_MIN_CONFIDENCE = 65       # discard low-confidence OCR guesses (0-100 scale); high threshold to avoid noise
@@ -438,14 +439,105 @@ def chunk_texts_for_translation(texts: List[str]) -> List[List[int]]:
     return batches
 
 
-def translate_blocks(blocks: List[TextBlock], progress_cb=None) -> None:
+def merge_blocks_into_paragraphs(blocks: List[TextBlock]) -> List[TextBlock]:
     """
-    Translate every block's text from French to English in-place.
-    Falls back to the original French text for any block that fails to
-    translate, so a single network hiccup never crashes the whole run.
+    PyMuPDF often reports each visual LINE as its own separate block,
+    especially inside table cells. Translating line-by-line is bad for two
+    reasons: it produces poor, context-free translations ("Deformation"
+    split from "of the shoulders"), and it multiplies the number of
+    network requests by ~2-3x, which triggers rate limiting.
+
+    This merges blocks that clearly belong to the same paragraph/cell:
+    same horizontal column (bboxes overlap on X) and vertically adjacent
+    (gap smaller than roughly one line height). The merged block keeps the
+    union bounding box, so it still renders in exactly the right place.
     """
     if not blocks:
-        return
+        return []
+
+    # Sort into reading order: top-to-bottom, then left-to-right.
+    ordered = sorted(blocks, key=lambda b: (round(b.bbox.y0, 1), round(b.bbox.x0, 1)))
+
+    merged: List[TextBlock] = []
+    current = ordered[0]
+
+    for nxt in ordered[1:]:
+        # Horizontal overlap ratio between the two boxes
+        overlap_x = min(current.bbox.x1, nxt.bbox.x1) - max(current.bbox.x0, nxt.bbox.x0)
+        min_width = max(min(current.bbox.width, nxt.bbox.width), 1.0)
+        same_column = (overlap_x / min_width) > 0.75
+
+        # Left edges should roughly line up — real paragraphs are aligned.
+        # This stops a wide header being glued to a narrow cell below it.
+        left_aligned = abs(current.bbox.x0 - nxt.bbox.x0) <= max(current.font_size * 1.5, 8.0)
+
+        # Widths should be comparable, so we don't merge a full-width
+        # banner row into a narrow table cell.
+        w_ratio = min(current.bbox.width, nxt.bbox.width) / max(current.bbox.width, nxt.bbox.width, 1.0)
+        similar_width = w_ratio > 0.6
+
+        # Vertical gap between bottom of current and top of next
+        vertical_gap = nxt.bbox.y0 - current.bbox.y1
+        line_height = max(current.font_size, 6.0)
+        adjacent = -line_height * 0.5 <= vertical_gap <= line_height * 1.2
+
+        # Similar font size => same logical paragraph (avoids merging a
+        # heading into the body text below it)
+        similar_size = abs(current.font_size - nxt.font_size) <= max(current.font_size * 0.25, 0.8)
+
+        if same_column and left_aligned and similar_width and adjacent and similar_size:
+            current = TextBlock(
+                text=(current.text.rstrip() + " " + nxt.text.lstrip()).strip(),
+                bbox=current.bbox | nxt.bbox,  # union of the two rects
+                font_size=min(current.font_size, nxt.font_size),
+                color=current.color,
+            )
+        else:
+            merged.append(current)
+            current = nxt
+
+    merged.append(current)
+    return merged
+
+
+def _translate_one(translator, text: str, max_retries: int = 4) -> Optional[str]:
+    """
+    Translate a single string with exponential backoff.
+
+    The free Google endpoint throttles aggressive callers, which is what
+    caused text to be silently left in French in earlier versions. Rather
+    than giving up on the first error, we back off and retry. Returns None
+    if every attempt failed, so the caller can report it honestly instead
+    of silently substituting the original text.
+    """
+    delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            result = translator.translate(text)
+            if result and result.strip():
+                return result
+            # Empty result is treated as a failure worth retrying
+        except Exception:
+            pass
+
+        if attempt < max_retries - 1:
+            time.sleep(delay)
+            delay *= 2  # 1s, 2s, 4s
+
+    return None
+
+
+def translate_blocks(blocks: List[TextBlock], progress_cb=None) -> dict:
+    """
+    Translate every block's text from French to English in-place.
+
+    Returns a stats dict: {"translated": n, "failed": n, "cached": n}
+    so the caller can tell the user honestly how much succeeded, rather
+    than silently leaving French text in the output.
+    """
+    stats = {"translated": 0, "failed": 0, "cached": 0}
+    if not blocks:
+        return stats
 
     if not TRANSLATOR_AVAILABLE:
         raise RuntimeError(
@@ -454,31 +546,41 @@ def translate_blocks(blocks: List[TextBlock], progress_cb=None) -> None:
         )
 
     translator = GoogleTranslator(source="fr", target="en")
-    texts = [b.text for b in blocks]
-    batches = chunk_texts_for_translation(texts)
 
-    done = 0
-    for batch_idx, indices in enumerate(batches):
-        batch_texts = [texts[i] for i in indices]
-        try:
-            # deep-translator supports batch translation via translate_batch
-            translated = translator.translate_batch(batch_texts)
-        except Exception:
-            # Fall back to translating one-by-one so a single bad string
-            # doesn't sink the whole batch.
-            translated = []
-            for t in batch_texts:
-                try:
-                    translated.append(translator.translate(t))
-                except Exception:
-                    translated.append(t)  # keep French if translation fails
+    # Cache identical strings. Documents like technical tables repeat
+    # phrases heavily, so this cuts request count substantially.
+    cache: dict = {}
 
-        for local_i, global_i in enumerate(indices):
-            result = translated[local_i] if local_i < len(translated) else None
-            blocks[global_i].translated_text = result or blocks[global_i].text
-            done += 1
-            if progress_cb:
-                progress_cb(done, len(blocks))
+    for i, block in enumerate(blocks):
+        key = block.text.strip()
+
+        if key in cache:
+            cached_val = cache[key]
+            block.translated_text = cached_val if cached_val else block.text
+            if cached_val:
+                stats["cached"] += 1
+            else:
+                stats["failed"] += 1
+        else:
+            result = _translate_one(translator, key)
+            cache[key] = result
+            if result:
+                block.translated_text = result
+                stats["translated"] += 1
+            else:
+                # Honest failure: keep French, but COUNT it so we can report
+                block.translated_text = block.text
+                stats["failed"] += 1
+
+            # Gentle throttle between genuinely new requests to stay under
+            # the free endpoint's rate limit. This is the single biggest
+            # fix for text being randomly left untranslated.
+            time.sleep(TRANSLATE_THROTTLE_SECONDS)
+
+        if progress_cb:
+            progress_cb(i + 1, len(blocks))
+
+    return stats
 
 
 def fit_text_in_box(
@@ -532,11 +634,12 @@ def process_pdf(
     status_cb=None,
     progress_cb=None,
     use_ocr: bool = True,
-) -> bytes:
+) -> Tuple[bytes, dict]:
     """
-    Full pipeline: open -> extract (native + OCR) -> redact -> render
-    background -> translate -> reconstruct. Returns the translated PDF
-    as bytes.
+    Full pipeline: open -> extract (native + OCR) -> merge into paragraphs
+    -> redact -> render background -> translate -> reconstruct.
+
+    Returns (pdf_bytes, translation_stats).
     """
     src_doc = fitz.open(stream=file_bytes, filetype="pdf")
     out_doc = fitz.open()
@@ -569,6 +672,11 @@ def process_pdf(
                 any_ocr_blocks_found = True
             blocks.extend(ocr_blocks)
 
+        # Merge line-fragments into coherent paragraphs. This improves
+        # translation quality AND cuts the number of network requests,
+        # which is the main cause of text being left untranslated.
+        blocks = merge_blocks_into_paragraphs(blocks)
+
         # Only use pixel redaction if we actually found OCR blocks AND OCR is enabled.
         # For clean native-text PDFs, use non-pixel redaction to preserve diagram quality.
         redact_blocks(page, blocks, redact_image_pixels=(any_ocr_blocks_found and use_ocr))
@@ -600,7 +708,7 @@ def process_pdf(
         if progress_cb:
             progress_cb(0.4 + (done / max(total, 1)) * 0.4)  # translation = next 40%
 
-    translate_blocks(flat_blocks, progress_cb=_t_progress)
+    translate_stats = translate_blocks(flat_blocks, progress_cb=_t_progress)
 
     # --- Pass 3: reconstruct each page -----------------------------------
     for pno in range(total_pages):
@@ -620,7 +728,7 @@ def process_pdf(
 
     out_bytes = out_doc.tobytes(garbage=4, deflate=True)
     out_doc.close()
-    return out_bytes
+    return out_bytes, translate_stats
 
 
 # ---------------------------------------------------------------------------
@@ -696,13 +804,27 @@ def main():
 
             try:
                 start = time.time()
-                result_bytes = process_pdf(
+                result_bytes, tstats = process_pdf(
                     file_bytes, status_cb=status_cb, progress_cb=progress_cb, use_ocr=use_ocr
                 )
                 elapsed = time.time() - start
 
                 progress_bar.progress(1.0)
-                status_placeholder.success(f"Done in {elapsed:.1f} seconds!")
+
+                failed = tstats.get("failed", 0)
+                ok = tstats.get("translated", 0) + tstats.get("cached", 0)
+
+                if failed == 0:
+                    status_placeholder.success(
+                        f"Done in {elapsed:.0f} seconds — all {ok} text blocks translated."
+                    )
+                else:
+                    status_placeholder.warning(
+                        f"Done in {elapsed:.0f} seconds — {ok} blocks translated, "
+                        f"but **{failed} could not be translated** and were left in French. "
+                        "This is almost always the free translation service rate-limiting. "
+                        "Wait a minute and run it again, and the failed blocks will usually go through."
+                    )
 
                 st.session_state.translated_pdf_bytes = result_bytes
                 base_name = uploaded_file.name.rsplit(".", 1)[0]
