@@ -1,0 +1,4 @@
+streamlit>=1.32.0
+PyMuPDF>=1.24.0
+deep-translator>=1.11.4
+Pillow>=10.0.0
