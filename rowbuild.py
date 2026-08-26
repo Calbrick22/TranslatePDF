@@ -147,17 +147,31 @@ def build_filtered_document(
             continue
 
         h = row.height
+
+        # A full-page unit (a slide, or a page with no table) gets its own
+        # output page at full size rather than being inset by margins.
+        full_page_unit = h >= (page_h - 2 * PAGE_MARGIN)
+
+        if full_page_unit:
+            current_page = out.new_page(width=page_w, height=page_h)
+            strip = _crop_strip(page_backgrounds[row.page_no], row.y0, row.y1, zoom)
+            rect = fitz.Rect(0, 0, page_w, page_h)
+            current_page.insert_image(rect, stream=_img_to_png_bytes(strip))
+
+            dy = -row.y0
+            for b in row_blocks.get(key, []):
+                draw_text(current_page, b, dy)
+
+            # Force the next row onto a new page
+            y_cursor = usable_bottom + 1
+            continue
+
         needs_new_page = (
             current_page is None
             or y_cursor + h > usable_bottom
         )
         if needs_new_page:
             start_new_page(row.page_no)
-
-            # A single row taller than a whole page still has to go somewhere;
-            # place it and let it use the full page.
-            if y_cursor + h > usable_bottom and y_cursor > PAGE_MARGIN:
-                pass
 
         strip = _crop_strip(page_backgrounds[row.page_no], row.y0, row.y1, zoom)
         rect = fitz.Rect(0, y_cursor, page_w, y_cursor + h)

@@ -1,2 +1,4 @@
 tesseract-ocr
 tesseract-ocr-fra
+libreoffice-writer
+libreoffice-impress

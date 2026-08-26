@@ -56,9 +56,10 @@ import requests
 
 from rowfilter import (
     TableRow, scan_document, summarise_countries, build_rows,
-    assign_countries, UNKNOWN_LABEL,
+    assign_countries, build_page_unit, page_looks_tabular, UNKNOWN_LABEL,
 )
 from rowbuild import assign_blocks_to_rows, build_filtered_document
+import officeconv
 import streamlit as st
 from PIL import Image
 
@@ -355,6 +356,79 @@ def header_band_for_page(page: fitz.Page, rows: List[TableRow]) -> Optional[fitz
     if first_top <= 2:
         return None
     return fitz.Rect(0, 0, page.rect.width, first_top)
+
+def extract_text_lines(page: fitz.Page) -> List[TextBlock]:
+    """
+    Extract text at LINE granularity rather than block granularity.
+
+    PyMuPDF sometimes reports an entire table as a single text block. When
+    filtering by row that's fatal: one block spanning many rows gets
+    assigned to whichever row contains its midpoint, so every other row
+    comes out empty and that one row gets all the text piled into it.
+
+    Working line-by-line gives fine-grained pieces that can be assigned to
+    the correct row and then merged back into paragraphs *within* that row.
+    """
+    lines: List[TextBlock] = []
+    raw = page.get_text("dict")
+
+    for block in raw.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+
+        for line in block.get("lines", []):
+            text_parts = []
+            sizes = []
+            color = (0, 0, 0)
+            x0 = y0 = x1 = y1 = None
+
+            for span in line.get("spans", []):
+                span_text = span.get("text", "")
+                if not span_text.strip():
+                    continue
+                text_parts.append(span_text)
+                sizes.append(span.get("size", 10.0))
+
+                c = span.get("color", 0)
+                color = (
+                    ((c >> 16) & 255) / 255.0,
+                    ((c >> 8) & 255) / 255.0,
+                    (c & 255) / 255.0,
+                )
+
+                sx0, sy0, sx1, sy1 = span.get("bbox", line.get("bbox"))
+                x0 = sx0 if x0 is None else min(x0, sx0)
+                y0 = sy0 if y0 is None else min(y0, sy0)
+                x1 = sx1 if x1 is None else max(x1, sx1)
+                y1 = sy1 if y1 is None else max(y1, sy1)
+
+            text = "".join(text_parts).strip()
+            if not text or x0 is None:
+                continue
+
+            lines.append(
+                TextBlock(
+                    text=text,
+                    bbox=fitz.Rect(x0, y0, x1, y1),
+                    font_size=max(sum(sizes) / len(sizes) if sizes else 10.0, 6.0),
+                    color=color,
+                )
+            )
+
+    return lines
+
+
+def merge_within_rows(blocks_by_row: dict) -> dict:
+    """
+    Merge line fragments into paragraphs, but only among lines that share a
+    row. This keeps translation context without ever gluing one table row's
+    text onto the next one's.
+    """
+    return {
+        key: merge_blocks_into_paragraphs(blist)
+        for key, blist in blocks_by_row.items()
+    }
+
 
 def extract_text_blocks(page: fitz.Page) -> List[TextBlock]:
     """
@@ -1126,7 +1200,7 @@ def fit_text_in_box(
     )
 
 
-def scan_pdf_countries(file_bytes: bytes, zoom: float = 2.0):
+def scan_pdf_countries(file_bytes: bytes, zoom: float = 2.0, granularity: str = "auto"):
     """
     Pass 1 for the filtering workflow: detect table rows and their
     countries of origin, without translating anything.
@@ -1135,7 +1209,7 @@ def scan_pdf_countries(file_bytes: bytes, zoom: float = 2.0):
     """
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     try:
-        rows = scan_document(doc, zoom=zoom)
+        rows = scan_document(doc, zoom=zoom, granularity=granularity)
         summary = summarise_countries(rows)
     finally:
         doc.close()
@@ -1150,6 +1224,7 @@ def process_pdf_filtered(
     progress_cb=None,
     use_ocr: bool = False,
     render_zoom: float = RENDER_ZOOM,
+    granularity: str = "auto",
 ) -> Tuple[bytes, dict]:
     """
     Translate and rebuild the PDF keeping ONLY rows whose country of origin
@@ -1184,17 +1259,34 @@ def process_pdf_filtered(
 
         page = src[pno]
 
-        rows, v_lines = build_rows(page, pno, zoom=2.0)
-        country_col = assign_countries(page, rows, v_lines, country_col) or country_col
+        if granularity == "pages":
+            tabular = False
+        elif granularity == "rows":
+            tabular = True
+        else:
+            tabular = page_looks_tabular(page, 2.0)
 
-        blocks = extract_text_blocks(page)
+        if tabular:
+            rows, v_lines = build_rows(page, pno, zoom=2.0)
+            country_col = assign_countries(page, rows, v_lines, country_col) or country_col
+        else:
+            rows = build_page_unit(page, pno)
+            assign_countries(page, rows, [], None)
+
+        # Line-level extraction, so a block spanning several table rows
+        # can't dump all its text into one row.
+        blocks = extract_text_lines(page)
         if use_ocr and OCR_AVAILABLE:
             blocks.extend(ocr_extract_blocks(page, blocks))
-        blocks = merge_blocks_into_paragraphs(blocks)
 
         mapping = assign_blocks_to_rows(blocks, rows)
+        # Merge into paragraphs only within each row, never across rows.
+        mapping = merge_within_rows(mapping)
         for ridx, blist in mapping.items():
             row_blocks[(pno, ridx)] = blist
+
+        # Redaction needs the full flat list for this page
+        blocks = [b for blist in mapping.values() for b in blist]
 
         for ridx, r in enumerate(rows):
             if not r.is_header and r.country in wanted:
@@ -1426,9 +1518,10 @@ def main():
         layout="centered",
     )
 
-    st.title("📄 French → English PDF Translator")
+    st.title("📄 French → English Document Translator")
     st.write(
-        "Upload a French PDF and get back an English version that "
+        "Upload a French **PDF, Word or PowerPoint** file and get back an "
+        "English PDF that "
         "**looks exactly the same** — same images, same layout, same "
         "positions — just translated."
     )
@@ -1523,9 +1616,13 @@ def main():
 
     uploaded_file = st.file_uploader(
         "Drag and drop your French PDF here",
-        type=["pdf"],
+        type=["pdf", "docx", "doc", "pptx", "ppt", "odt", "odp", "rtf"],
         accept_multiple_files=False,
-        help="Only .pdf files are supported. Maximum recommended size: ~50 pages.",
+        help=(
+            "PDF, Word (.docx/.doc) and PowerPoint (.pptx/.ppt) are supported. "
+            "Office files are converted to PDF automatically. The output is "
+            "always a PDF."
+        ),
     )
 
     if "translated_pdf_bytes" not in st.session_state:
@@ -1536,7 +1633,23 @@ def main():
         st.session_state.scanned_filename = None
 
     if uploaded_file is not None:
-        st.success(f"Loaded: **{uploaded_file.name}** ({uploaded_file.size / 1024:.0f} KB)")
+        needs_conversion = not uploaded_file.name.lower().endswith(".pdf")
+
+        if needs_conversion and not officeconv.office_available():
+            st.error(
+                "This is a "
+                f"{officeconv.describe(uploaded_file.name)}, which needs "
+                "LibreOffice installed to convert it to PDF. See the README "
+                "for the one-time install step, or save the file as a PDF "
+                "yourself and upload that instead."
+            )
+            st.stop()
+
+        st.success(
+            f"Loaded: **{uploaded_file.name}** ({uploaded_file.size / 1024:.0f} KB)"
+            + (f" — {officeconv.describe(uploaded_file.name)}, will be converted to PDF"
+               if needs_conversion else "")
+        )
 
         # ---------------------------------------------------------------
         # Optional filtering by country of origin
@@ -1562,7 +1675,9 @@ def main():
                 if st.button("🔎 Scan for countries", use_container_width=True):
                     with st.spinner("Scanning table rows..."):
                         try:
-                            _, summary = scan_pdf_countries(uploaded_file.getvalue())
+                            pdf_for_scan, _ = officeconv.prepare_pdf_bytes(
+                                uploaded_file.getvalue(), uploaded_file.name)
+                            _, summary = scan_pdf_countries(pdf_for_scan)
                             st.session_state.country_summary = summary
                             st.session_state.scanned_filename = uploaded_file.name
                         except Exception as e:
@@ -1611,7 +1726,15 @@ def main():
         )
 
         if translate_clicked:
-            file_bytes = uploaded_file.read()
+            file_bytes = uploaded_file.getvalue()
+            if needs_conversion:
+                try:
+                    file_bytes, _ = officeconv.prepare_pdf_bytes(
+                        file_bytes, uploaded_file.name
+                    )
+                except RuntimeError as conv_err:
+                    st.error(str(conv_err))
+                    st.stop()
 
             progress_bar = st.progress(0.0)
             status_placeholder = st.empty()

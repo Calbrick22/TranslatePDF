@@ -66,8 +66,8 @@ UNKNOWN_LABEL = "(no country identified)"
 
 # Pixel-scan tuning
 LINE_DARKNESS = 128      # below this grey value counts as "ink"
-LINE_COVERAGE = 0.5      # fraction of the width/height that must be ink
-MIN_ROW_HEIGHT_PTS = 18  # ignore bands thinner than this
+LINE_COVERAGE = 0.30     # longest unbroken run must span this fraction of the page
+MIN_ROW_HEIGHT_PTS = 10  # ignore bands thinner than this (compact tables have ~12pt rows)
 
 
 @dataclass
@@ -91,9 +91,35 @@ def _render_grey(page: fitz.Page, zoom: float) -> np.ndarray:
     return np.array(img)
 
 
-def _find_line_positions(mask_fraction: np.ndarray, zoom: float) -> List[float]:
-    """Group consecutive high-coverage indices into single line positions."""
-    hits = [i for i, f in enumerate(mask_fraction) if f > LINE_COVERAGE]
+def _longest_run_fraction(ink: np.ndarray, axis: int) -> np.ndarray:
+    """
+    For each row (axis=1) or column (axis=0), return the longest run of
+    consecutive ink pixels as a fraction of that line's full length.
+
+    Using the longest *contiguous* run rather than total ink coverage
+    matters: a table narrower or shorter than the page still produces a
+    solid unbroken rule, whereas coverage-of-the-whole-page would miss it.
+    It also rejects a line of dense text, which has lots of ink but no
+    long unbroken run.
+    """
+    mat = ink if axis == 1 else ink.T
+    length = mat.shape[1]
+    out = np.zeros(mat.shape[0], dtype=float)
+
+    for i in range(mat.shape[0]):
+        row = mat[i].astype(np.int8)
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], row, [0]))))
+        if edges.size < 2:
+            continue
+        runs = edges[1::2] - edges[0::2]
+        if runs.size:
+            out[i] = runs.max() / float(length)
+    return out
+
+
+def _find_line_positions(run_fraction: np.ndarray, zoom: float) -> List[float]:
+    """Group consecutive high-run indices into single line positions."""
+    hits = [i for i, f in enumerate(run_fraction) if f > LINE_COVERAGE]
     groups: List[List[int]] = []
     for i in hits:
         if groups and i - groups[-1][-1] <= 3:
@@ -110,6 +136,12 @@ def detect_grid(page: fitz.Page, zoom: float = 2.0) -> Tuple[List[float], List[f
 
     Detected from pixels rather than vector drawings, so this works on
     flattened/scanned pages as well as native ones.
+
+    Vertical rules are searched only *within* the band spanned by the
+    horizontal rules, and measured against that band's height rather than
+    the whole page. A table occupying a fifth of the page still has full
+    height verticals relative to itself, so measuring against the page
+    would miss them entirely.
     """
     try:
         arr = _render_grey(page, zoom)
@@ -117,8 +149,16 @@ def detect_grid(page: fitz.Page, zoom: float = 2.0) -> Tuple[List[float], List[f
         return [], []
 
     ink = arr < LINE_DARKNESS
-    h_lines = _find_line_positions(ink.mean(axis=1), zoom)
-    v_lines = _find_line_positions(ink.mean(axis=0), zoom)
+    h_lines = _find_line_positions(_longest_run_fraction(ink, axis=1), zoom)
+
+    if len(h_lines) >= 2:
+        top = max(int(round(min(h_lines) * zoom)) - 2, 0)
+        bottom = min(int(round(max(h_lines) * zoom)) + 2, ink.shape[0])
+        band = ink[top:bottom, :] if bottom > top else ink
+    else:
+        band = ink
+
+    v_lines = _find_line_positions(_longest_run_fraction(band, axis=0), zoom)
     return h_lines, v_lines
 
 
@@ -144,8 +184,12 @@ def build_rows(page: fitz.Page, page_no: int, zoom: float = 2.0) -> Tuple[List[T
     if not rows:
         return [TableRow(page_no=page_no, y0=page.rect.y0, y1=page.rect.y1)], v_lines
 
-    # The first band under the top line is the column-header row.
+    # The first band under the top line is the column-header row. Extend it
+    # up to the top of the page so anything above the table - a document
+    # title, a heading - travels with the header instead of being orphaned
+    # and shifted off the page.
     rows[0].is_header = True
+    rows[0].y0 = page.rect.y0
     return rows, v_lines
 
 
@@ -222,15 +266,65 @@ def assign_countries(
     return country_col
 
 
-def scan_document(doc: fitz.Document, zoom: float = 2.0) -> List[TableRow]:
-    """Detect rows and countries across the whole document."""
+def build_page_unit(page: fitz.Page, page_no: int) -> List[TableRow]:
+    """
+    Treat the whole page as a single filterable unit.
+
+    This is the right granularity for presentations, where each slide is one
+    logical item, and for documents that have no ruled table.
+    """
+    return [TableRow(page_no=page_no, y0=page.rect.y0, y1=page.rect.y1)]
+
+
+def page_looks_tabular(page: fitz.Page, zoom: float = 2.0) -> bool:
+    """
+    Decide whether a page holds a ruled table worth splitting into rows.
+
+    Requires several horizontal rules AND at least a couple of verticals,
+    so a page with one underline or a header rule isn't mistaken for a table.
+    """
+    h_lines, v_lines = detect_grid(page, zoom)
+    usable_h = [
+        a for a, b in zip(sorted(h_lines), sorted(h_lines)[1:])
+        if b - a >= MIN_ROW_HEIGHT_PTS
+    ]
+    return len(usable_h) >= 2 and len(v_lines) >= 3
+
+
+def scan_document(
+    doc: fitz.Document,
+    zoom: float = 2.0,
+    granularity: str = "auto",
+) -> List[TableRow]:
+    """
+    Detect filterable units and their countries across the document.
+
+    granularity:
+      "auto"  - per-row on tabular pages, per-page elsewhere (default)
+      "rows"  - always split ruled tables into rows
+      "pages" - always treat each page/slide as one unit
+    """
     all_rows: List[TableRow] = []
     country_col: Optional[Tuple[float, float]] = None
 
     for pno in range(doc.page_count):
         page = doc[pno]
-        rows, v_lines = build_rows(page, pno, zoom)
-        country_col = assign_countries(page, rows, v_lines, country_col) or country_col
+
+        if granularity == "pages":
+            tabular = False
+        elif granularity == "rows":
+            tabular = True
+        else:
+            tabular = page_looks_tabular(page, zoom)
+
+        if tabular:
+            rows, v_lines = build_rows(page, pno, zoom)
+            country_col = assign_countries(page, rows, v_lines, country_col) or country_col
+        else:
+            rows = build_page_unit(page, pno)
+            # Match against everything on the page/slide
+            assign_countries(page, rows, [], None)
+
         all_rows.extend(rows)
 
     return all_rows
