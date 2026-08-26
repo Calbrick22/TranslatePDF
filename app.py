@@ -43,10 +43,11 @@ Author: Generated for a non-technical end user - see README for usage.
 
 import io
 import re
-import threading
+
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -65,6 +66,46 @@ try:
     TRANSLATOR_AVAILABLE = True
 except ImportError:
     TRANSLATOR_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# CRITICAL: force a network timeout on the translation library.
+#
+# deep-translator calls requests.get() with NO timeout argument. If the
+# connection stalls (common when the free endpoint throttles you), that
+# call blocks *forever*, the worker thread never returns, and the whole
+# app appears frozen with no progress and no error.
+#
+# We wrap the requests module used inside deep_translator so every call
+# gets a timeout whether the library asked for one or not.
+# ---------------------------------------------------------------------------
+REQUEST_TIMEOUT_SECONDS = 20
+
+if TRANSLATOR_AVAILABLE:
+    try:
+        import deep_translator.google as _dt_google
+
+        class _TimeoutRequests:
+            """Thin proxy that injects a default timeout into every call."""
+
+            def __init__(self, real_requests):
+                self._real = real_requests
+
+            def get(self, *args, **kwargs):
+                kwargs.setdefault("timeout", REQUEST_TIMEOUT_SECONDS)
+                return self._real.get(*args, **kwargs)
+
+            def post(self, *args, **kwargs):
+                kwargs.setdefault("timeout", REQUEST_TIMEOUT_SECONDS)
+                return self._real.post(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        _dt_google.requests = _TimeoutRequests(_dt_google.requests)
+    except Exception:
+        # If the library's internals change, we still work - just without
+        # the enforced timeout.
+        pass
 
 # ---------------------------------------------------------------------------
 # OCR backend (catches French text that has no real text layer, e.g. text
@@ -96,6 +137,7 @@ MAX_CHARS_PER_TRANSLATE_CALL = 4000  # character budget for one batched request
 MAX_ITEMS_PER_BATCH = 20             # how many text blocks to pack into one request
 TRANSLATE_WORKERS = 6                # parallel requests in flight
 BATCH_DELIMITER = "@@@"              # marker used to split a batched response
+TRANSLATE_DEADLINE_SECONDS = 240     # hard cap: never hang longer than this
 REDACT_PADDING = 0.6         # small padding so redaction fully covers glyph edges
 OCR_ZOOM = 3.0                # resolution used when rendering the page for OCR
 OCR_MIN_CONFIDENCE = 65       # discard low-confidence OCR guesses (0-100 scale); high threshold to avoid noise
@@ -625,32 +667,54 @@ def translate_blocks(blocks: List[TextBlock], progress_cb=None) -> dict:
 
     # --- 2 & 3. Batch and parallelise ------------------------------------
     batches = _build_batches(unique_texts)
-    completed = 0
     total_batches = max(len(batches), 1)
-    lock = threading.Lock()
 
     def run_batch(batch_indices: List[int]):
-        # Each worker needs its own translator instance (not thread-safe).
+        """Runs in a worker thread. Must NOT touch Streamlit or shared UI."""
         translator = GoogleTranslator(source="fr", target="en")
         batch_texts = [unique_texts[i] for i in batch_indices]
         out = _translate_group(translator, batch_texts)
 
         # --- 4. Verify / repair -----------------------------------------
-        # Any item the batch couldn't deliver gets one honest solo attempt.
         for local_i, global_i in enumerate(batch_indices):
             value = out[local_i] if local_i < len(out) else None
             if value is None:
                 value = _translate_one(translator, unique_texts[global_i])
             results[global_i] = value
+        return len(batch_indices)
 
-        nonlocal completed
-        with lock:
-            completed += 1
-            if progress_cb:
-                progress_cb(completed, total_batches)
+    # Progress is driven from THIS (main) thread via as_completed.
+    # Calling Streamlit from a worker thread silently does nothing, which
+    # is why the progress bar previously appeared frozen.
+    #
+    # NOTE: we deliberately do NOT use `with ThreadPoolExecutor(...)`.
+    # The context manager calls shutdown(wait=True) on exit, which blocks
+    # until every worker finishes - so a single hung request would still
+    # freeze the app despite the deadline. We shut down without waiting.
+    timed_out = False
+    completed = 0
+    pool = ThreadPoolExecutor(max_workers=TRANSLATE_WORKERS)
+    try:
+        futures = [pool.submit(run_batch, b) for b in batches]
+        try:
+            for fut in as_completed(futures, timeout=TRANSLATE_DEADLINE_SECONDS):
+                try:
+                    fut.result()
+                except Exception:
+                    pass  # counted later via results[] being None
+                completed += 1
+                if progress_cb:
+                    progress_cb(completed, total_batches)
+        except FuturesTimeoutError:
+            timed_out = True
+    finally:
+        # wait=False so hung network threads can never freeze the UI.
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # cancel_futures needs Python 3.9+
+            pool.shutdown(wait=False)
 
-    with ThreadPoolExecutor(max_workers=TRANSLATE_WORKERS) as pool:
-        list(pool.map(run_batch, batches))
+    stats["timed_out"] = timed_out
 
     # --- Apply results back onto every block -----------------------------
     for b in blocks:
@@ -927,8 +991,18 @@ def main():
 
                 failed = tstats.get("failed", 0)
                 ok = tstats.get("translated", 0) + tstats.get("cached", 0)
+                timed_out = tstats.get("timed_out", False)
 
-                if failed == 0:
+                if timed_out:
+                    status_placeholder.error(
+                        f"⏱️ Translation timed out after "
+                        f"{TRANSLATE_DEADLINE_SECONDS // 60} minutes. "
+                        f"{ok} blocks were translated; {failed} were left in French. "
+                        "The translation service is likely rate-limiting or unreachable "
+                        "right now. Your partial PDF is still available below — "
+                        "wait a few minutes and try again."
+                    )
+                elif failed == 0:
                     status_placeholder.success(
                         f"Done in {elapsed:.0f} seconds — all {ok} text blocks translated."
                     )
@@ -936,8 +1010,8 @@ def main():
                     status_placeholder.warning(
                         f"Done in {elapsed:.0f} seconds — {ok} blocks translated, "
                         f"but **{failed} could not be translated** and were left in French. "
-                        "This is almost always the free translation service rate-limiting. "
-                        "Wait a minute and run it again, and the failed blocks will usually go through."
+                        "This is usually temporary rate-limiting. "
+                        "Wait a minute and run it again."
                     )
 
                 st.session_state.translated_pdf_bytes = result_bytes
