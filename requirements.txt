@@ -3,4 +3,5 @@ PyMuPDF>=1.24.0
 requests>=2.31.0
 deep-translator>=1.11.4
 Pillow>=10.0.0
+numpy>=1.24.0
 pytesseract>=0.3.10
