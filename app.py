@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import fitz  # PyMuPDF
+import requests
 import streamlit as st
 from PIL import Image
 
@@ -137,7 +138,8 @@ MAX_CHARS_PER_TRANSLATE_CALL = 4000  # character budget for one batched request
 MAX_ITEMS_PER_BATCH = 20             # how many text blocks to pack into one request
 TRANSLATE_WORKERS = 6                # parallel requests in flight
 BATCH_DELIMITER = "@@@"              # marker used to split a batched response
-TRANSLATE_DEADLINE_SECONDS = 240     # hard cap: never hang longer than this
+TRANSLATE_DEADLINE_SECONDS = 180     # hard cap on the whole translation stage
+REPAIR_BATCH_SIZE = 10               # small batches when retrying failed items
 REDACT_PADDING = 0.6         # small padding so redaction fully covers glyph edges
 OCR_ZOOM = 3.0                # resolution used when rendering the page for OCR
 OCR_MIN_CONFIDENCE = 65       # discard low-confidence OCR guesses (0-100 scale); high threshold to avoid noise
@@ -547,77 +549,157 @@ def merge_blocks_into_paragraphs(blocks: List[TextBlock]) -> List[TextBlock]:
     return merged
 
 
-def _translate_one(translator, text: str, max_retries: int = 4) -> Optional[str]:
-    """
-    Translate a single string with exponential backoff.
+# ---------------------------------------------------------------------------
+# Translation providers
+# ---------------------------------------------------------------------------
+# Two backends are supported:
+#
+#   DeepL (recommended) - needs a free API key, but is reliable, fast, has
+#       NATIVE batch support (up to 50 texts per request, returned aligned
+#       by index) and generally better French->English quality.
+#
+#   Google (no key) - convenient for a quick try, but it is an unofficial
+#       scraped endpoint that aggressively rate-limits and stalls. This is
+#       what caused the freezing.
+#
+# Both implement: translate_many(texts) -> List[Optional[str]], returning a
+# list the SAME length as the input, with None for anything that failed.
+# ---------------------------------------------------------------------------
 
-    Returns None if every attempt failed, so the caller can report it
-    honestly instead of silently substituting the original text.
+DEEPL_FREE_URL = "https://api-free.deepl.com/v2/translate"
+DEEPL_PRO_URL = "https://api.deepl.com/v2/translate"
+DEEPL_MAX_TEXTS_PER_REQUEST = 50
+
+
+class DeepLProvider:
     """
-    delay = 0.8
-    for attempt in range(max_retries):
+    Direct DeepL API client.
+
+    Uses DeepL's native multi-text batching: we send up to 50 strings in one
+    request and get back a list in the same order. Because the API preserves
+    ordering and count, there is no delimiter to be mangled and no risk of a
+    translation landing in the wrong box.
+    """
+
+    name = "DeepL"
+    max_batch_items = DEEPL_MAX_TEXTS_PER_REQUEST
+    max_batch_chars = 100_000  # DeepL handles large payloads comfortably
+
+    def __init__(self, api_key: str, source: str = "FR", target: str = "EN-GB"):
+        self.api_key = api_key.strip()
+        self.source = source
+        self.target = target
+        # DeepL free keys conventionally end in ":fx"
+        self.url = DEEPL_FREE_URL if self.api_key.endswith(":fx") else DEEPL_PRO_URL
+
+    def translate_many(self, texts: List[str]) -> List[Optional[str]]:
+        if not texts:
+            return []
+
         try:
-            result = translator.translate(text)
-            if result and result.strip():
-                return result
+            resp = requests.post(
+                self.url,
+                data=[
+                    ("auth_key", self.api_key),
+                    ("source_lang", self.source),
+                    ("target_lang", self.target),
+                ] + [("text", t) for t in texts],
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
         except Exception:
-            pass
-        if attempt < max_retries - 1:
-            time.sleep(delay)
-            delay *= 2
-    return None
+            return [None] * len(texts)
+
+        if resp.status_code == 403:
+            raise RuntimeError(
+                "DeepL rejected the API key (403). Please double-check you "
+                "pasted the whole key, including the ':fx' suffix on free keys."
+            )
+        if resp.status_code == 456:
+            raise RuntimeError(
+                "This DeepL key has used up its monthly character quota. "
+                "The free tier allows 500,000 characters per month."
+            )
+        if resp.status_code != 200:
+            return [None] * len(texts)
+
+        try:
+            payload = resp.json()
+            out = [item.get("text") for item in payload.get("translations", [])]
+        except Exception:
+            return [None] * len(texts)
+
+        # Alignment guarantee: refuse anything that doesn't match exactly.
+        if len(out) != len(texts):
+            return [None] * len(texts)
+
+        return [o if (o and o.strip()) else None for o in out]
 
 
-def _translate_group(translator, texts: List[str]) -> List[Optional[str]]:
+class GoogleProvider:
     """
-    Translate several strings in ONE network request by joining them with a
-    delimiter, then splitting the result back apart.
+    Free Google endpoint via deep-translator.
 
-    This is the single biggest speed win: instead of 320 requests we make
-    roughly 20. The delimiter is a line containing only a marker, which
-    survives translation intact in practice.
-
-    Correctness is never assumed. If the translated text doesn't split back
-    into exactly the same number of pieces, we discard the whole batch
-    result and return None for each item, letting the caller retry those
-    individually. That makes batching a pure optimisation: it can make
-    things faster, but it can never scramble or misalign your text.
+    No native batching, so we emulate it by joining texts with a delimiter
+    and splitting the response. If the split doesn't line up exactly, the
+    whole batch is discarded and the caller retries those items solo.
     """
-    if not texts:
-        return []
-    if len(texts) == 1:
-        return [_translate_one(translator, texts[0])]
 
-    joined = f"\n{BATCH_DELIMITER}\n".join(texts)
+    name = "Google (free, no key)"
+    max_batch_items = MAX_ITEMS_PER_BATCH
+    max_batch_chars = MAX_CHARS_PER_TRANSLATE_CALL
 
-    raw = _translate_one(translator, joined, max_retries=2)
-    if not raw:
-        return [None] * len(texts)
+    def __init__(self, source: str = "fr", target: str = "en"):
+        if not TRANSLATOR_AVAILABLE:
+            raise RuntimeError(
+                "The 'deep-translator' package is not installed. "
+                "Please run: pip install deep-translator"
+            )
+        self._translator = GoogleTranslator(source=source, target=target)
 
-    # Translation may alter spacing/case around the marker, so split loosely.
-    parts = re.split(rf"\s*{re.escape(BATCH_DELIMITER)}\s*", raw)
+    def _translate_single(self, text: str) -> Optional[str]:
+        try:
+            result = self._translator.translate(text)
+            return result if (result and result.strip()) else None
+        except Exception:
+            return None
 
-    if len(parts) != len(texts):
-        # Misaligned - refuse the batch entirely rather than risk
-        # attaching the wrong translation to the wrong box.
-        return [None] * len(texts)
+    def translate_many(self, texts: List[str]) -> List[Optional[str]]:
+        if not texts:
+            return []
+        if len(texts) == 1:
+            return [self._translate_single(texts[0])]
 
-    return [p.strip() if p.strip() else None for p in parts]
+        joined = f"\n{BATCH_DELIMITER}\n".join(texts)
+        raw = self._translate_single(joined)
+        if not raw:
+            return [None] * len(texts)
+
+        parts = re.split(rf"\s*{re.escape(BATCH_DELIMITER)}\s*", raw)
+        if len(parts) != len(texts):
+            return [None] * len(texts)
+
+        return [p.strip() if p.strip() else None for p in parts]
 
 
-def _build_batches(texts: List[str]) -> List[List[int]]:
+def _build_batches(texts: List[str], provider) -> List[List[int]]:
     """
-    Group indices into batches that are small enough to translate reliably
-    in a single request (character budget + a cap on items per batch).
+    Group indices into batches sized for the provider.
+
+    DeepL accepts up to 50 texts natively per request, so we can pack more
+    in. Google's scraped endpoint has a 5000-character input cap and needs
+    the delimiter trick, so we stay conservative there.
     """
+    max_items = getattr(provider, "max_batch_items", MAX_ITEMS_PER_BATCH)
+    max_chars = getattr(provider, "max_batch_chars", MAX_CHARS_PER_TRANSLATE_CALL)
+
     batches: List[List[int]] = []
     current: List[int] = []
     current_len = 0
 
     for i, t in enumerate(texts):
         t_len = len(t) + len(BATCH_DELIMITER) + 2
-        too_long = current_len + t_len > MAX_CHARS_PER_TRANSLATE_CALL
-        too_many = len(current) >= MAX_ITEMS_PER_BATCH
+        too_long = current_len + t_len > max_chars
+        too_many = len(current) >= max_items
 
         if current and (too_long or too_many):
             batches.append(current)
@@ -631,104 +713,114 @@ def _build_batches(texts: List[str]) -> List[List[int]]:
     return batches
 
 
-def translate_blocks(blocks: List[TextBlock], progress_cb=None) -> dict:
+def translate_blocks(blocks, provider, progress_cb=None) -> dict:
     """
     Translate every block from French to English in-place.
 
-    Strategy, fastest path first:
-      1. De-duplicate  - identical strings are translated once.
-      2. Batch         - ~20 items per request instead of 1.
-      3. Parallelise   - several batches in flight at once.
-      4. Verify        - any batch that doesn't split cleanly is retried
-                         item-by-item, so speed never costs correctness.
+    The design priority here is *never freezing*. Every stage checks a shared
+    deadline, so this always returns within TRANSLATE_DEADLINE_SECONDS no
+    matter how badly the network misbehaves.
 
-    Returns {"translated": n, "failed": n, "cached": n}.
+    Returns {"translated": n, "failed": n, "cached": n, "timed_out": bool}.
     """
-    stats = {"translated": 0, "failed": 0, "cached": 0}
+    stats = {"translated": 0, "failed": 0, "cached": 0, "timed_out": False}
     if not blocks:
         return stats
 
-    if not TRANSLATOR_AVAILABLE:
-        raise RuntimeError(
-            "The 'deep-translator' package is not installed. "
-            "Please run: pip install deep-translator"
-        )
+    deadline = time.monotonic() + TRANSLATE_DEADLINE_SECONDS
 
-    # --- 1. De-duplicate -------------------------------------------------
-    unique_texts: List[str] = []
-    seen: dict = {}
+    def out_of_time() -> bool:
+        return time.monotonic() >= deadline
+
+    # --- De-duplicate ----------------------------------------------------
+    unique_texts = []
+    seen = {}
     for b in blocks:
         key = b.text.strip()
         if key not in seen:
             seen[key] = len(unique_texts)
             unique_texts.append(key)
 
-    results: List[Optional[str]] = [None] * len(unique_texts)
+    results = [None] * len(unique_texts)
 
-    # --- 2 & 3. Batch and parallelise ------------------------------------
-    batches = _build_batches(unique_texts)
-    total_batches = max(len(batches), 1)
-
-    def run_batch(batch_indices: List[int]):
-        """Runs in a worker thread. Must NOT touch Streamlit or shared UI."""
-        translator = GoogleTranslator(source="fr", target="en")
-        batch_texts = [unique_texts[i] for i in batch_indices]
-        out = _translate_group(translator, batch_texts)
-
-        # --- 4. Verify / repair -----------------------------------------
-        for local_i, global_i in enumerate(batch_indices):
-            value = out[local_i] if local_i < len(out) else None
-            if value is None:
-                value = _translate_one(translator, unique_texts[global_i])
-            results[global_i] = value
-        return len(batch_indices)
-
-    # Progress is driven from THIS (main) thread via as_completed.
-    # Calling Streamlit from a worker thread silently does nothing, which
-    # is why the progress bar previously appeared frozen.
-    #
-    # NOTE: we deliberately do NOT use `with ThreadPoolExecutor(...)`.
-    # The context manager calls shutdown(wait=True) on exit, which blocks
-    # until every worker finishes - so a single hung request would still
-    # freeze the app despite the deadline. We shut down without waiting.
-    timed_out = False
+    # --- Build batches ---------------------------------------------------
+    batches = _build_batches(unique_texts, provider)
+    total_units = max(len(batches), 1)
     completed = 0
+
+    def run_batch(batch_indices):
+        """Worker thread. Never touches Streamlit."""
+        if out_of_time():
+            return
+        batch_texts = [unique_texts[i] for i in batch_indices]
+        out = provider.translate_many(batch_texts)
+        for local_i, global_i in enumerate(batch_indices):
+            results[global_i] = out[local_i] if local_i < len(out) else None
+
+    # --- Pass 1: batched + parallel --------------------------------------
+    # Progress is reported from THIS (main) thread. Streamlit calls made
+    # from worker threads silently do nothing, which is why the bar
+    # previously appeared frozen.
+    #
+    # We deliberately avoid `with ThreadPoolExecutor(...)`: its __exit__
+    # calls shutdown(wait=True), which blocks on hung network threads and
+    # would freeze the UI despite the deadline.
     pool = ThreadPoolExecutor(max_workers=TRANSLATE_WORKERS)
     try:
         futures = [pool.submit(run_batch, b) for b in batches]
+        remaining = max(deadline - time.monotonic(), 0.1)
         try:
-            for fut in as_completed(futures, timeout=TRANSLATE_DEADLINE_SECONDS):
+            for fut in as_completed(futures, timeout=remaining):
                 try:
                     fut.result()
                 except Exception:
-                    pass  # counted later via results[] being None
+                    pass
                 completed += 1
                 if progress_cb:
-                    progress_cb(completed, total_batches)
+                    progress_cb(completed, total_units)
         except FuturesTimeoutError:
-            timed_out = True
+            stats["timed_out"] = True
     finally:
-        # wait=False so hung network threads can never freeze the UI.
         try:
             pool.shutdown(wait=False, cancel_futures=True)
-        except TypeError:  # cancel_futures needs Python 3.9+
+        except TypeError:
             pool.shutdown(wait=False)
 
-    stats["timed_out"] = timed_out
+    # --- Pass 2: repair leftovers, STRICTLY time-boxed -------------------
+    # This is the path that froze the app. Previously every failed item got
+    # 4 solo retries at a 20s timeout, so ONE bad batch of 20 items could
+    # block for ~27 minutes showing no progress. Now repair works in small
+    # batches, checks the deadline before each one, and stops cleanly.
+    missing = [i for i, r in enumerate(results) if r is None]
+    if missing and not out_of_time():
+        repair_batches = [
+            missing[i:i + REPAIR_BATCH_SIZE]
+            for i in range(0, len(missing), REPAIR_BATCH_SIZE)
+        ]
+        for rb in repair_batches:
+            if out_of_time():
+                stats["timed_out"] = True
+                break
+            try:
+                out = provider.translate_many([unique_texts[i] for i in rb])
+            except RuntimeError:
+                raise  # API key / quota errors must reach the user
+            except Exception:
+                out = [None] * len(rb)
+            for local_i, global_i in enumerate(rb):
+                if local_i < len(out) and out[local_i]:
+                    results[global_i] = out[local_i]
 
-    # --- Apply results back onto every block -----------------------------
+    # --- Apply results ---------------------------------------------------
     for b in blocks:
-        key = b.text.strip()
-        idx = seen[key]
-        value = results[idx]
+        value = results[seen[b.text.strip()]]
         if value:
             b.translated_text = value
             stats["translated"] += 1
         else:
-            b.translated_text = b.text  # honest fallback, counted below
+            b.translated_text = b.text  # honest fallback, counted
             stats["failed"] += 1
 
-    # Count how many were served from de-duplication rather than new requests
     stats["cached"] = max(len(blocks) - len(unique_texts), 0)
     return stats
 
@@ -785,6 +877,7 @@ def process_pdf(
     progress_cb=None,
     use_ocr: bool = True,
     render_zoom: float = RENDER_ZOOM,
+    provider=None,
 ) -> Tuple[bytes, dict]:
     """
     Full pipeline: open -> extract (native + OCR) -> merge into paragraphs
@@ -859,7 +952,7 @@ def process_pdf(
         if progress_cb:
             progress_cb(0.4 + (done / max(total, 1)) * 0.4)  # translation = next 40%
 
-    translate_stats = translate_blocks(flat_blocks, progress_cb=_t_progress)
+    translate_stats = translate_blocks(flat_blocks, provider, progress_cb=_t_progress)
 
     # --- Pass 3: reconstruct each page -----------------------------------
     for pno in range(total_pages):
@@ -900,13 +993,8 @@ def main():
         "positions — just translated."
     )
 
-    if not TRANSLATOR_AVAILABLE:
-        st.error(
-            "Missing dependency: `deep-translator`. Please install "
-            "requirements first (`pip install -r requirements.txt`) and "
-            "restart the app."
-        )
-        st.stop()
+    # Note: only the Google engine needs deep-translator. DeepL talks to its
+    # API directly, so a missing deep-translator must not block the app.
 
     use_ocr = st.checkbox(
         "🔍 Also detect text in images/scans (OCR) — only enable if needed",
@@ -924,6 +1012,41 @@ def main():
             "The app will still work perfectly for PDFs with native text layers. "
             "See the README to install Tesseract if you need OCR for scanned documents."
         )
+
+    engine = st.radio(
+        "Translation engine",
+        ["DeepL (recommended — needs a free key)", "Google (no key, less reliable)"],
+        index=0,
+        help=(
+            "DeepL is faster, more accurate, and doesn't stall. Google needs "
+            "no setup but uses an unofficial endpoint that frequently "
+            "rate-limits and can leave text untranslated."
+        ),
+    )
+    use_deepl = engine.startswith("DeepL")
+
+    deepl_key = ""
+    if use_deepl:
+        deepl_key = st.text_input(
+            "DeepL API key",
+            type="password",
+            placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx",
+            help="Your key is used only for this translation and is never stored.",
+        )
+        with st.expander("How to get a free DeepL key (2 minutes)"):
+            st.markdown(
+                """
+1. Go to **https://www.deepl.com/pro-api** and choose **DeepL API Free**.
+2. Sign up. It asks for a card to verify identity but the free tier is
+   **not charged** — it covers 500,000 characters per month.
+3. Open **Account → API Keys** and copy your key. Free keys end in `:fx`.
+4. Paste it into the box above.
+
+500,000 characters is roughly 200–250 pages of a document like yours per month.
+                """
+            )
+        if not deepl_key:
+            st.info("Enter your DeepL key above, or switch to Google to try without one.")
 
     quality = st.select_slider(
         "Output quality",
@@ -978,12 +1101,23 @@ def main():
 
             try:
                 start = time.time()
+
+                # Build the chosen provider
+                if use_deepl:
+                    if not deepl_key:
+                        st.error("Please enter your DeepL API key first.")
+                        st.stop()
+                    provider = DeepLProvider(deepl_key)
+                else:
+                    provider = GoogleProvider()
+
                 result_bytes, tstats = process_pdf(
                     file_bytes,
                     status_cb=status_cb,
                     progress_cb=progress_cb,
                     use_ocr=use_ocr,
                     render_zoom=render_zoom,
+                    provider=provider,
                 )
                 elapsed = time.time() - start
 
